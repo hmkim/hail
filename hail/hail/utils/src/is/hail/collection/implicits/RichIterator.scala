@@ -119,15 +119,16 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
       val watchdog = new Thread("timeout watchdog for " + command) {
         override def run(): Unit =
           try {
-            Thread.sleep(timeoutMillis)
-            if (proc.isAlive) {
+            if (!proc.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)) {
               error.synchronized {
                 error.append(s"\n[process timed out after $timeoutMillis ms]\n")
                 ()
               }
               proc.destroy()
-              if (!proc.waitFor(5, TimeUnit.SECONDS))
+              if (!proc.waitFor(5, TimeUnit.SECONDS)) {
                 proc.destroyForcibly()
+                proc.waitFor()
+              }
             }
           } catch {
             case _: InterruptedException => Thread.currentThread().interrupt()

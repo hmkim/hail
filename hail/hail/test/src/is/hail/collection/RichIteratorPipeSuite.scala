@@ -26,6 +26,30 @@ class RichIteratorPipeSuite {
   }
 
   @Test
+  def testPipeWatchdogExitsWithShortLivedProcess(): Unit = {
+    val marker = "hail-pipe-short-lived-watchdog"
+    for (_ <- 0 until 20) {
+      val (stdout, _, process) =
+        Iterator("input").pipe(
+          new ProcessBuilder("bash", "-c", s"cat >/dev/null; : $marker"),
+          _ => (),
+          (write, value) => write(value),
+          _ => (),
+          timeoutMillis = 30_000L,
+        )
+      assertFalse(stdout.hasNext)
+      assertTrue(process.waitFor() == 0)
+    }
+
+    val deadline = System.nanoTime() + 2_000_000_000L
+    def activeWatchdogs: Int =
+      Thread.getAllStackTraces.keySet().stream().filter(_.getName.contains(marker)).count().toInt
+    while (activeWatchdogs > 0 && System.nanoTime() < deadline)
+      Thread.sleep(10L)
+    assertTrue(activeWatchdogs == 0, s"$activeWatchdogs watchdog threads remained after process exit")
+  }
+
+  @Test
   def testPipeBoundsAndDrainsStderr(): Unit = {
     val limit = 128
     val (stdout, stderr, process) =
