@@ -14,7 +14,7 @@ MANIFEST_SHA256=$2
 IMAGE_URI=$3
 PROCESS_TIMEOUT_SECONDS=$4
 STDERR_MAX_BYTES=$5
-WORKDIR=/mnt1/loftee-emr-bootstrap
+WORKDIR=/mnt/loftee-emr-bootstrap
 MANIFEST=$WORKDIR/SHA256SUMS
 
 case "$PREFIX" in s3://*) ;; *) echo "resource prefix must use s3://" >&2; exit 2;; esac

@@ -38,3 +38,6 @@ def test_vep_bootstraps_inject_process_controls_and_have_valid_shell_syntax():
         assert "config['process_timeout_seconds'] = int(timeout)" in content
         assert "config['stderr_max_bytes'] = int(stderr_max)" in content
         subprocess.run(['bash', '-n', str(script)], check=True)
+    loftee = resources.files('hailtop.hailctl.emr').joinpath('resources/install-loftee-emr.sh').read_text()
+    assert 'WORKDIR=/mnt/loftee-emr-bootstrap' in loftee
+    assert 'WORKDIR=/mnt1/' not in loftee
