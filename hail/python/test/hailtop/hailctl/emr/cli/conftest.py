@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import pytest
 
 from hailtop.hailctl.emr.artifact import HailArtifactManifest
+from hailtop.hailctl.emr.vep import VEPProfileManifest
 
 
 @pytest.fixture
@@ -18,6 +19,31 @@ def artifact_manifest():
         wheel_sha256='b' * 64,
         wheelhouse_uri='s3://artifact-bucket/wheelhouse.tar.gz',
         wheelhouse_sha256='c' * 64,
+    )
+
+
+@pytest.fixture
+def vep_profile():
+    return VEPProfileManifest(
+        schema_version=1,
+        reference_genome='GRCh38',
+        vep_version='113.4',
+        loftee_version='1.0.4_GRCh38',
+        supported_regions=['us-east-1'],
+        image_uri='public.ecr.aws/example/vep@sha256:' + 'd' * 64,
+        cache_uri='s3://vep-profile/cache.tar.gz',
+        cache_sha256='e' * 64,
+        cache_size_bytes=25_000_000_000,
+        base_config_uri='s3://vep-profile/base.json',
+        base_config_sha256='f' * 64,
+        loftee_resource_prefix_uri='s3://vep-profile/loftee/',
+        loftee_manifest_sha256='1' * 64,
+        loftee_size_bytes=14_000_000_000,
+        storage_size_gb=200,
+        recommended_core_instance_type='r5.2xlarge',
+        executor_cores=1,
+        process_timeout_seconds=600,
+        stderr_max_bytes=1_048_576,
     )
 
 
@@ -60,11 +86,13 @@ def patch_aws(
     check_default_roles_mock,
     check_private_subnet_mock,
     check_custom_roles_mock,
+    vep_profile,
 ):
     monkeypatch.setattr(
         'hailtop.hailctl.emr.artifact.load_artifact_manifest',
         lambda path: artifact_manifest,
     )
+    monkeypatch.setattr('hailtop.hailctl.emr.vep.load_vep_profile', lambda path: vep_profile)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.emr_client', lambda region: emr_client_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.upload_to_s3', upload_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.resolve_region', lambda region: 'us-east-1')

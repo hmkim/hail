@@ -127,4 +127,41 @@ reserve YARN container memory or automatically change ``spark.executor.memoryOve
 Variant Effect Predictor (VEP)
 ------------------------------
 
-VEP on EMR is not supported in this initial Spark 4 release.
+VEP and LoFTEE can be installed when creating a GRCh38 cluster:
+
+.. code-block:: text
+
+    hailctl emr start NAME ... \
+        --vep GRCh38 \
+        --vep-manifest ./vep-grch38-profile.json
+
+The profile can instead be configured once:
+
+.. code-block:: text
+
+    hailctl config set emr/vep_grch38_manifest ./vep-grch38-profile.json
+    hailctl emr start NAME ... --vep GRCh38
+
+After the cluster is ready, Hail discovers the node-local configuration automatically, matching the
+Dataproc experience:
+
+.. code-block:: python
+
+    annotated = hl.vep(dataset)
+
+The initial EMR implementation supports only GRCh38 and requires an immutable profile supplied by the
+operator. The profile pins the VEP and LoFTEE versions, supported AWS regions, container image digest,
+S3 cache/config/reference locations and SHA256 checksums, storage size, instance recommendation,
+executor concurrency, process timeout, and stderr limit. Hail does not yet publish a default AWS
+profile, so ``--vep-manifest`` or ``emr/vep_grch38_manifest`` is required.
+
+VEP clusters default to the profile's memory-optimized core instance type, one VEP process per
+executor, and 200 GiB gp3 storage on primary and core nodes. Explicit ``--core-instance-type`` values
+are retained. Cache and LoFTEE data are installed on every node at cluster creation; an existing
+cluster cannot be retrofitted and must be recreated with ``--vep``.
+
+The bootstrap runs a container pinned by digest behind a root-owned wrapper with fixed read-only
+mounts. The EMR driver user (``hadoop``) and YARN executor user (``yarn``) may invoke only that wrapper;
+they are not added to the Docker group. Registry credentials are removed after image installation.
+Advanced request overlays must retain both checksum-verified VEP bootstraps and the automatic
+``VEP_CONFIG_URI`` settings.

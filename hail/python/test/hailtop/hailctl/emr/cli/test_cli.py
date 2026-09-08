@@ -454,3 +454,72 @@ def test_submit_rejects_non_s3_scratch(monkeypatch):
     assert res.exit_code != 0
     assert '--s3-scratch must be a valid S3 URI' in res.output
     assert not called
+
+
+def test_start_vep_dry_run_sets_profile_defaults_and_bootstraps():
+    res = runner.invoke(
+        cli.app,
+        [
+            'start',
+            'vep-cluster',
+            '--s3-scratch',
+            's3://bkt/tmp/',
+            '--vep',
+            'GRCh38',
+            '--vep-manifest',
+            'vep-profile.json',
+            '--dry-run',
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    request = json.loads(res.output)
+    assert [action['Name'] for action in request['BootstrapActions']] == [
+        'install-hail',
+        'install-vep-grch38',
+        'install-loftee-grch38',
+    ]
+    groups = {group['InstanceRole']: group for group in request['Instances']['InstanceGroups']}
+    assert groups['CORE']['InstanceType'] == 'r5.2xlarge'
+    for group in groups.values():
+        volume = group['EbsConfiguration']['EbsBlockDeviceConfigs'][0]['VolumeSpecification']
+        assert volume == {'VolumeType': 'gp3', 'SizeInGB': 200}
+    spark_defaults = next(
+        configuration
+        for configuration in request['Configurations']
+        if configuration['Classification'] == 'spark-defaults'
+    )['Properties']
+    assert spark_defaults['spark.executorEnv.VEP_CONFIG_URI'] == 'file:///vep_data/vep.json'
+    assert spark_defaults['spark.executor.cores'] == '1'
+
+
+def test_start_vep_uploads_three_content_addressed_bootstraps(emr_client_mock, upload_mock):
+    emr_client_mock.run_job_flow.return_value = {'JobFlowId': 'j-vep'}
+    res = runner.invoke(
+        cli.app,
+        [
+            'start',
+            'vep-cluster',
+            '--s3-scratch',
+            's3://bkt/tmp/',
+            '--vep',
+            'GRCh38',
+            '--vep-manifest',
+            'vep-profile.json',
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert upload_mock.call_count == 3
+    uploaded_paths = [call.args[0] for call in upload_mock.call_args_list]
+    assert any('/bootstrap/install-hail-emr-' in path for path in uploaded_paths)
+    assert any('/bootstrap/install-vep-emr-' in path for path in uploaded_paths)
+    assert any('/bootstrap/install-loftee-emr-' in path for path in uploaded_paths)
+
+
+def test_start_rejects_unsupported_vep_reference(emr_client_mock):
+    res = runner.invoke(
+        cli.app,
+        ['start', 'c1', '--s3-scratch', 's3://bkt/tmp/', '--vep', 'GRCh37', '--dry-run'],
+    )
+    assert res.exit_code != 0
+    assert '--vep currently supports only GRCh38' in res.output
+    assert emr_client_mock.run_job_flow.call_count == 0

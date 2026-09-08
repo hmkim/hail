@@ -154,6 +154,13 @@ def config_variables():
                     'should be a valid S3 URI such as s3://my-bucket/hail-tmp/',
                 ),
             ),
+            ConfigVariable.EMR_VEP_GRCH38_MANIFEST: ConfigVariableInfo(
+                help_msg='Local path to the immutable GRCh38 VEP profile manifest for EMR clusters',
+                validation=(
+                    lambda x: bool(x) and not any(ch.isspace() for ch in x),
+                    'should be a non-empty local path without whitespace',
+                ),
+            ),
         }
 
     return _config_variables

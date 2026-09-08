@@ -23,6 +23,7 @@ class ConfigVariable(str, Enum):
     QUERY_DISABLE_PROGRESS_BAR = 'query/disable_progress_bar'
     EMR_REGION = 'emr/region'
     EMR_REMOTE_TMPDIR = 'emr/remote_tmpdir'
+    EMR_VEP_GRCH38_MANIFEST = 'emr/vep_grch38_manifest'
     HTTP_TIMEOUT_IN_SECONDS = 'http/timeout_in_seconds'
 
     def to_section_option(self) -> Tuple[str, str]:
