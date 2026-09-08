@@ -7,7 +7,9 @@ import scala.io.Source
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
-import java.io.PrintWriter
+import java.io.{InputStreamReader, PrintWriter}
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
 
 class RichIterator[T](val it: Iterator[T]) extends AnyVal {
   def toStagingIterator: StagingIterator[T] = {
@@ -72,18 +74,68 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
     printHeader: (String => Unit) => Unit,
     printElement: (String => Unit, T) => Unit,
     printFooter: (String => Unit) => Unit,
+    timeoutMillis: Long = 0L,
+    maxStderrBytes: Int = Int.MaxValue,
   ): (Iterator[String], StringBuilder, Process) = {
+    require(timeoutMillis >= 0L, s"timeoutMillis must be non-negative, found $timeoutMillis")
+    require(maxStderrBytes > 0, s"maxStderrBytes must be positive, found $maxStderrBytes")
 
     val command = pb.command().asScala.mkString(" ")
 
     val proc = pb.start()
 
     val error = new StringBuilder()
-    // Start a thread capture the process stderr
-    new Thread("stderr reader for " + command) {
-      override def run(): Unit =
-        Source.fromInputStream(proc.getErrorStream).addString(error)
-    }.start()
+    val stderrReader = new Thread("stderr reader for " + command) {
+      override def run(): Unit = {
+        val reader = new InputStreamReader(proc.getErrorStream, StandardCharsets.UTF_8)
+        val buffer = new Array[Char](8192)
+        var captured = 0
+        var truncated = false
+        var n = reader.read(buffer)
+        while (n >= 0) {
+          val remaining = maxStderrBytes - captured
+          if (remaining > 0) {
+            val toAppend = math.min(n, remaining)
+            error.synchronized {
+              error.append(new String(buffer, 0, toAppend))
+              ()
+            }
+            captured += toAppend
+          }
+          if (n > remaining) truncated = true
+          n = reader.read(buffer)
+        }
+        if (truncated)
+          error.synchronized {
+            error.append(s"\n[stderr truncated after $maxStderrBytes characters]\n")
+            ()
+          }
+        reader.close()
+      }
+    }
+    stderrReader.start()
+
+    if (timeoutMillis > 0L) {
+      val watchdog = new Thread("timeout watchdog for " + command) {
+        override def run(): Unit =
+          try {
+            Thread.sleep(timeoutMillis)
+            if (proc.isAlive) {
+              error.synchronized {
+                error.append(s"\n[process timed out after $timeoutMillis ms]\n")
+                ()
+              }
+              proc.destroy()
+              if (!proc.waitFor(5, TimeUnit.SECONDS))
+                proc.destroyForcibly()
+            }
+          } catch {
+            case _: InterruptedException => Thread.currentThread().interrupt()
+          }
+      }
+      watchdog.setDaemon(true)
+      watchdog.start()
+    }
 
     // Start a thread to feed the process input from our parent's iterator
     new Thread("stdin writer for " + command) {
@@ -98,7 +150,7 @@ class RichIterator[T](val it: Iterator[T]) extends AnyVal {
     }.start()
 
     // Return an iterator that reads lines from the process's stdout,
-    // a StringBuilder that captures standard error that should not be read
+    // a bounded StringBuilder that captures standard error that should not be read
     // from or written to until waiting for the process, and the process itself
     (Source.fromInputStream(proc.getInputStream).getLines(), error, proc)
   }

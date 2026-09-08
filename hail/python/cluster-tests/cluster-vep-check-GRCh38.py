@@ -5,13 +5,10 @@ GNOMAD_CHR22_FIRST_1000 = "gs://hail-us-central1-vep/vep_examplars/gnomad3_chr22
 for path, csq in [(GNOMAD_CHR22_FIRST_1000, False)]:
     print(f"Checking 'hl.vep' replicates on '{path}'")
     expected = hl.read_matrix_table(path)
+    expected_rows = expected.rows().select('vep')
     actual = hl.vep(
-        expected.rows().select(), 'gs://hail-us-central1-vep/vep95-GRCh38-loftee-gcloud.json', csq=csq
+        expected_rows.select(), 'gs://hail-us-central1-vep/vep95-GRCh38-loftee-gcloud.json', csq=csq
     ).drop('vep_proc_id')
     actual._force_count()
-    # vep_result_agrees = actual._same(expected)
-    # if vep_result_agrees:
-    #     print('TEST PASSED')
-    # else:
-    #     print('TEST FAILED')
-    # assert vep_result_agrees
+    assert actual._same(expected_rows), f"VEP output did not match the golden dataset for {path}"
+    print('TEST PASSED')
