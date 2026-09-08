@@ -32,12 +32,31 @@ def test_vep_bootstraps_use_only_scoped_docker_wrapper():
 
 
 def test_vep_bootstraps_inject_process_controls_and_have_valid_shell_syntax():
+    contents = {}
     for name in ['install-vep-emr.sh', 'install-loftee-emr.sh']:
         script = resources.files('hailtop.hailctl.emr').joinpath(f'resources/{name}')
         content = script.read_text()
+        contents[name] = content
         assert "config['process_timeout_seconds'] = int(timeout)" in content
         assert "config['stderr_max_bytes'] = int(stderr_max)" in content
+        assert 'VEP_ROOT=/mnt/vep_data' in content
+        assert 'mountpoint -q /mnt' in content
+        assert 'tar --no-same-owner --no-same-permissions' in content
         subprocess.run(['bash', '-n', str(script)], check=True)
-    loftee = resources.files('hailtop.hailctl.emr').joinpath('resources/install-loftee-emr.sh').read_text()
-    assert 'WORKDIR=/mnt/loftee-emr-bootstrap' in loftee
+
+    base = contents['install-vep-emr.sh']
+    loftee = contents['install-loftee-emr.sh']
+    assert 'mktemp -d /mnt/vep-emr-bootstrap.XXXXXX' in base
+    assert 'CACHE_ARCHIVE=' not in base
+    assert 'stream_verify_sha256' in base
+    assert 'aws s3 cp "$CACHE_URI" - --only-show-errors' in base
+    assert '| stream_verify_sha256 "$CACHE_SHA256"' in base
+    assert 'mktemp -d /mnt/loftee-emr-bootstrap.XXXXXX' in loftee
     assert 'WORKDIR=/mnt1/' not in loftee
+    assert 'LOFTEE_ARCHIVE_NAME=loftee-v1.0.4_GRCh38.tar.gz' in loftee
+    assert 'aws s3 cp "$PREFIX/$LOFTEE_ARCHIVE_NAME" - --only-show-errors' in loftee
+    assert '| stream_verify_sha256 "$LOFTEE_ARCHIVE_SHA256"' in loftee
+    assert 'cp -a /vep_data' not in loftee
+    assert 'rm -rf /vep_data' not in loftee
+    assert 'ln -sfn /mnt/vep_data /vep_data' not in loftee
+    assert 'readlink -f /vep_data' in loftee

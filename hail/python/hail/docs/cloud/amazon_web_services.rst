@@ -157,11 +157,30 @@ profile, so ``--vep-manifest`` or ``emr/vep_grch38_manifest`` is required.
 
 VEP clusters default to the profile's memory-optimized core instance type, one VEP process per
 executor, and 200 GiB gp3 storage on primary and core nodes. Explicit ``--core-instance-type`` values
-are retained. Cache and LoFTEE data are installed on every node at cluster creation; an existing
-cluster cannot be retrofitted and must be recreated with ``--vep``.
+are retained. The base bootstrap establishes ``/vep_data`` as a link to ``/mnt/vep_data`` before
+installing any resources, so the cache and LoFTEE data use the profile-sized volume from the start
+and no later copy/delete migration is required. Large cache and plugin archives stream from S3 through
+a SHA256-verifying pass-through process directly into ``tar`` on the final volume, avoiding a second
+full archive copy. A mismatch fails the bootstrap before the cluster becomes ready or VEP is invoked.
+Small configuration and executable-support resources are staged and verified before installation.
+
+The Hail wheel, bundled JAR, bootstrap scripts, VEP configuration, and container image remain the
+code-bearing artifacts governed by the exact Hail artifact and profile contracts. Checksums on large
+VEP reference datasets are an additional provenance and scientific reproducibility check, not a
+requirement to stage those datasets locally before extraction. Cache and LoFTEE data are installed on
+every node at cluster creation; an existing cluster cannot be retrofitted and must be recreated with
+``--vep``.
 
 The bootstrap runs a container pinned by digest behind a root-owned wrapper with fixed read-only
 mounts. The EMR driver user (``hadoop``) and YARN executor user (``yarn``) may invoke only that wrapper;
-they are not added to the Docker group. Registry credentials are removed after image installation.
-Advanced request overlays must retain both checksum-verified VEP bootstraps and the automatic
-``VEP_CONFIG_URI`` settings.
+they are not added to the Docker group. Normal Hail execution obtains the wrapper argument vector from
+the checksum-verified, root-installed VEP configuration and streams variant records over standard
+input; variant data is not evaluated as shell or Docker arguments. The wrapper fixes the image,
+executable, and host paths and passes its quoted argument array without shell evaluation.
+
+This initial design assumes a single-tenant cluster where principals allowed to submit arbitrary Spark
+code as ``hadoop`` or ``yarn`` are trusted. The wrapper is not intended as a security boundary against
+a malicious principal that already controls either operating-system identity; a multi-tenant deployment
+would require a stricter fixed argument contract or separate isolation. Registry credentials are
+removed after image installation. Advanced request overlays must retain both checksum-verified VEP
+bootstraps and the automatic ``VEP_CONFIG_URI`` settings.

@@ -14,8 +14,7 @@ MANIFEST_SHA256=$2
 IMAGE_URI=$3
 PROCESS_TIMEOUT_SECONDS=$4
 STDERR_MAX_BYTES=$5
-WORKDIR=/mnt/loftee-emr-bootstrap
-MANIFEST=$WORKDIR/SHA256SUMS
+VEP_ROOT=/mnt/vep_data
 
 case "$PREFIX" in s3://*) ;; *) echo "resource prefix must use s3://" >&2; exit 2;; esac
 [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -23,33 +22,80 @@ case "$PREFIX" in s3://*) ;; *) echo "resource prefix must use s3://" >&2; exit 
 [[ "$PROCESS_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]
 [[ "$STDERR_MAX_BYTES" =~ ^[1-9][0-9]*$ ]]
 
-rm -rf "$WORKDIR"
-mkdir -p "$WORKDIR" /mnt/vep_data
-if [[ -d /vep_data && ! -L /vep_data ]]; then
-  cp -a /vep_data/. /mnt/vep_data/
-  rm -rf /vep_data
+if ! mountpoint -q /mnt; then
+  echo "/mnt must be the profile-sized VEP volume" >&2
+  exit 1
 fi
-ln -sfn /mnt/vep_data /vep_data
-mkdir -p /vep_data/loftee /vep_data/loftee_data /vep_data/bin /usr/local/libexec
+if [[ ! -L /vep_data || "$(readlink -f /vep_data)" != "$VEP_ROOT" || ! -d "$VEP_ROOT" ]]; then
+  echo "base VEP bootstrap did not establish /vep_data -> $VEP_ROOT" >&2
+  exit 1
+fi
+if [[ -e "$VEP_ROOT/loftee" || -L "$VEP_ROOT/loftee" ]]; then
+  echo "LoFTEE destination unexpectedly exists before installation" >&2
+  exit 1
+fi
+WORKDIR=$(mktemp -d /mnt/loftee-emr-bootstrap.XXXXXX)
+trap 'rm -rf -- "$WORKDIR"' EXIT
+MANIFEST=$WORKDIR/SHA256SUMS
+RESOURCE_SUMS=$WORKDIR/SHA256SUMS.resources
+LOFTEE_ARCHIVE_NAME=loftee-v1.0.4_GRCh38.tar.gz
+LOFTEE_ARCHIVE_SHA256=
+install -d -o root -g root -m 0755 \
+  "$VEP_ROOT/loftee" "$VEP_ROOT/loftee_data" "$VEP_ROOT/bin" /usr/local/libexec
+
+stream_verify_sha256() {
+  local expected=$1
+  python3.12 -c '
+import hashlib
+import sys
+
+expected = sys.argv[1]
+digest = hashlib.sha256()
+while chunk := sys.stdin.buffer.read(8 * 1024 * 1024):
+    digest.update(chunk)
+    sys.stdout.buffer.write(chunk)
+actual = digest.hexdigest()
+if actual != expected:
+    print(f"SHA256 mismatch: expected {expected}, found {actual}", file=sys.stderr)
+    raise SystemExit(1)
+' "$expected"
+}
+
 aws s3 cp "$PREFIX/SHA256SUMS" "$MANIFEST" --only-show-errors
 printf '%s  %s\n' "$MANIFEST_SHA256" "$MANIFEST" | sha256sum -c -
+: > "$RESOURCE_SUMS"
 
 while read -r checksum filename; do
-  aws s3 cp "$PREFIX/$filename" "$WORKDIR/$filename" --only-show-errors
+  [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
+  filename=${filename#\*}
+  case "$filename" in
+    /*|../*|*/../*|*/..) echo "LoFTEE manifest contains an unsafe path: $filename" >&2; exit 1;;
+  esac
+  if [[ "$filename" == "$LOFTEE_ARCHIVE_NAME" ]]; then
+    LOFTEE_ARCHIVE_SHA256=$checksum
+    continue
+  fi
+  destination=$WORKDIR/$filename
+  mkdir -p "$(dirname "$destination")"
+  aws s3 cp "$PREFIX/$filename" "$destination" --only-show-errors
+  printf '%s  %s\n' "$checksum" "$filename" >> "$RESOURCE_SUMS"
 done < "$MANIFEST"
-( cd "$WORKDIR" && sha256sum -c SHA256SUMS )
+[[ "$LOFTEE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+( cd "$WORKDIR" && sha256sum -c SHA256SUMS.resources )
 
-rm -rf /vep_data/loftee
-mkdir -p /vep_data/loftee
-tar -xzf "$WORKDIR/loftee-v1.0.4_GRCh38.tar.gz" -C /vep_data/loftee --strip-components=1
-install -m 0644 "$WORKDIR/gerp_conservation_scores.homo_sapiens.GRCh38.bw" /vep_data/loftee_data/
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz" /vep_data/loftee_data/
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz.fai" /vep_data/loftee_data/
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz.gzi" /vep_data/loftee_data/
-gzip -dc "$WORKDIR/loftee.sql.gz" > /vep_data/loftee_data/loftee.sql
-install -m 0755 "$WORKDIR/samtools-faidx-shim" /vep_data/bin/samtools
-install -m 0644 "$WORKDIR/vep113-GRCh38-loftee-emr.json" /vep_data/vep.json
-python3.12 - /vep_data/vep.json "$PROCESS_TIMEOUT_SECONDS" "$STDERR_MAX_BYTES" <<'PY'
+# Stream the large plugin archive to its final directory. The verified manifest supplies its digest.
+aws s3 cp "$PREFIX/$LOFTEE_ARCHIVE_NAME" - --only-show-errors \
+  | stream_verify_sha256 "$LOFTEE_ARCHIVE_SHA256" \
+  | tar --no-same-owner --no-same-permissions -xzf - \
+      -C "$VEP_ROOT/loftee" --strip-components=1
+install -m 0644 "$WORKDIR/gerp_conservation_scores.homo_sapiens.GRCh38.bw" "$VEP_ROOT/loftee_data/"
+install -m 0644 "$WORKDIR/human_ancestor.fa.gz" "$VEP_ROOT/loftee_data/"
+install -m 0644 "$WORKDIR/human_ancestor.fa.gz.fai" "$VEP_ROOT/loftee_data/"
+install -m 0644 "$WORKDIR/human_ancestor.fa.gz.gzi" "$VEP_ROOT/loftee_data/"
+gzip -dc "$WORKDIR/loftee.sql.gz" > "$VEP_ROOT/loftee_data/loftee.sql"
+install -m 0755 "$WORKDIR/samtools-faidx-shim" "$VEP_ROOT/bin/samtools"
+install -m 0644 "$WORKDIR/vep113-GRCh38-loftee-emr.json" "$VEP_ROOT/vep.json"
+python3.12 - "$VEP_ROOT/vep.json" "$PROCESS_TIMEOUT_SECONDS" "$STDERR_MAX_BYTES" <<'PY'
 import json
 import sys
 
@@ -62,7 +108,7 @@ with open(path, 'w') as f:
     json.dump(config, f, sort_keys=True)
     f.write('\n')
 PY
-chmod -R a+rX /vep_data
+chmod -R a+rX "$VEP_ROOT"
 
 cat > /usr/local/libexec/vep-emr-root <<EOF
 #!/bin/bash

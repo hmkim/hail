@@ -18,8 +18,8 @@ IMAGE_URI=$5
 REGION=$6
 PROCESS_TIMEOUT_SECONDS=$7
 STDERR_MAX_BYTES=$8
-CACHE_ARCHIVE=/tmp/vep-cache.tar.gz
-CONFIG_PATH=/vep_data/vep113-GRCh38-base.json
+VEP_ROOT=/mnt/vep_data
+CONFIG_PATH=${VEP_ROOT}/vep113-GRCh38-base.json
 REGISTRY=${IMAGE_URI%%/*}
 
 case "$CACHE_URI" in s3://*) ;; *) echo "cache URI must use s3://" >&2; exit 2;; esac
@@ -30,17 +30,51 @@ case "$CONFIG_URI" in s3://*) ;; *) echo "config URI must use s3://" >&2; exit 2
 [[ "$PROCESS_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]
 [[ "$STDERR_MAX_BYTES" =~ ^[1-9][0-9]*$ ]]
 
+if ! mountpoint -q /mnt; then
+  echo "/mnt must be the profile-sized VEP volume" >&2
+  exit 1
+fi
+if [[ -e /vep_data || -L /vep_data || -e "$VEP_ROOT" || -L "$VEP_ROOT" ]]; then
+  echo "VEP data paths must not exist before the base bootstrap" >&2
+  exit 1
+fi
+install -d -o root -g root -m 0755 "$VEP_ROOT"
+ln -s "$VEP_ROOT" /vep_data
+WORKDIR=$(mktemp -d /mnt/vep-emr-bootstrap.XXXXXX)
+trap 'rm -rf -- "$WORKDIR"' EXIT
+CONFIG_STAGED=${WORKDIR}/vep113-GRCh38-base.json
+
+stream_verify_sha256() {
+  local expected=$1
+  python3.12 -c '
+import hashlib
+import sys
+
+expected = sys.argv[1]
+digest = hashlib.sha256()
+while chunk := sys.stdin.buffer.read(8 * 1024 * 1024):
+    digest.update(chunk)
+    sys.stdout.buffer.write(chunk)
+actual = digest.hexdigest()
+if actual != expected:
+    print(f"SHA256 mismatch: expected {expected}, found {actual}", file=sys.stderr)
+    raise SystemExit(1)
+' "$expected"
+}
+
 dnf install -y docker
 systemctl enable --now docker
 
-mkdir -p /vep_data
-aws s3 cp "$CACHE_URI" "$CACHE_ARCHIVE" --only-show-errors
-printf '%s  %s\n' "$CACHE_SHA256" "$CACHE_ARCHIVE" | sha256sum -c -
-tar -xzf "$CACHE_ARCHIVE" -C /vep_data
-rm -f "$CACHE_ARCHIVE"
+# Cache data is not executable Hail code. Stream it directly to the final profile-sized volume.
+# The pipeline still fails the bootstrap before cluster readiness if the profile digest does not match.
+aws s3 cp "$CACHE_URI" - --only-show-errors \
+  | stream_verify_sha256 "$CACHE_SHA256" \
+  | tar --no-same-owner --no-same-permissions -xzf - -C "$VEP_ROOT"
 
-aws s3 cp "$CONFIG_URI" "$CONFIG_PATH" --only-show-errors
-printf '%s  %s\n' "$CONFIG_SHA256" "$CONFIG_PATH" | sha256sum -c -
+# The config controls the executable argument vector, so verify it before installing it.
+aws s3 cp "$CONFIG_URI" "$CONFIG_STAGED" --only-show-errors
+printf '%s  %s\n' "$CONFIG_SHA256" "$CONFIG_STAGED" | sha256sum -c -
+install -m 0644 "$CONFIG_STAGED" "$CONFIG_PATH"
 python3.12 - "$CONFIG_PATH" "$PROCESS_TIMEOUT_SECONDS" "$STDERR_MAX_BYTES" <<'PY'
 import json
 import sys
@@ -54,7 +88,7 @@ with open(path, 'w') as f:
     json.dump(config, f, sort_keys=True)
     f.write('\n')
 PY
-chmod -R a+rX /vep_data
+chmod -R a+rX "$VEP_ROOT"
 
 if [[ "$REGISTRY" == *.dkr.ecr.*.amazonaws.com ]]; then
   aws ecr get-login-password --region "$REGION" \
