@@ -31,6 +31,19 @@ DEFAULT_SERVICE_ROLE = 'EMR_DefaultRole'
 DEFAULT_JOB_FLOW_ROLE = 'EMR_EC2_DefaultRole'
 
 
+def s3_bucket_region(bucket: str, client=None) -> str:
+    if client is None:
+        import boto3  # pylint: disable=import-outside-toplevel
+
+        client = boto3.client('s3')
+    location = client.get_bucket_location(Bucket=bucket).get('LocationConstraint')
+    if location in (None, ''):
+        return 'us-east-1'
+    if location == 'EU':
+        return 'eu-west-1'
+    return location
+
+
 def _is_access_denied(exc: Exception) -> bool:
     code = getattr(exc, 'response', {}).get('Error', {}).get('Code')
     return code in {'AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation'}

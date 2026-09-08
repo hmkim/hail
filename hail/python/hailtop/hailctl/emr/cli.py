@@ -314,6 +314,10 @@ def start(
         print(json.dumps(kwargs, indent=2))
         return
 
+    if vep_profile_obj is not None:
+        for warning in vep_profile_obj.region_warnings(resolved_region, emr.s3_bucket_region):
+            typer.echo(f'Warning: {warning}.', err=True)
+
     final_uses_default_service_role = kwargs.get('ServiceRole') == emr.DEFAULT_SERVICE_ROLE
     final_uses_default_job_flow_role = kwargs.get('JobFlowRole') == emr.DEFAULT_JOB_FLOW_ROLE
     if final_uses_default_service_role or final_uses_default_job_flow_role:

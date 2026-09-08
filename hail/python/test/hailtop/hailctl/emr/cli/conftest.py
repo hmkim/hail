@@ -33,12 +33,10 @@ def vep_profile():
         image_uri='public.ecr.aws/example/vep@sha256:' + 'd' * 64,
         cache_uri='s3://vep-profile/cache.tar.gz',
         cache_sha256='e' * 64,
-        cache_size_bytes=25_000_000_000,
         base_config_uri='s3://vep-profile/base.json',
         base_config_sha256='f' * 64,
         loftee_resource_prefix_uri='s3://vep-profile/loftee/',
         loftee_manifest_sha256='1' * 64,
-        loftee_size_bytes=14_000_000_000,
         storage_size_gb=200,
         recommended_core_instance_type='r5.2xlarge',
         executor_cores=1,
@@ -96,6 +94,7 @@ def patch_aws(
     monkeypatch.setattr('hailtop.hailctl.emr.emr.emr_client', lambda region: emr_client_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.upload_to_s3', upload_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.resolve_region', lambda region: 'us-east-1')
+    monkeypatch.setattr('hailtop.hailctl.emr.emr.s3_bucket_region', lambda bucket: 'us-east-1')
     monkeypatch.setattr('hailtop.hailctl.emr.emr.check_default_roles', check_default_roles_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.check_custom_roles', check_custom_roles_mock)
     monkeypatch.setattr('hailtop.hailctl.emr.emr.check_private_subnet', check_private_subnet_mock)

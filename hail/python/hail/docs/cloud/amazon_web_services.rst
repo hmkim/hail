@@ -152,17 +152,21 @@ Dataproc experience:
 The initial EMR implementation supports only GRCh38 and requires an immutable profile supplied by the
 operator. The profile pins the VEP and LoFTEE versions, supported AWS regions, container image digest,
 S3 cache/config/reference locations and SHA256 checksums, storage size, instance recommendation,
-executor concurrency, process timeout, and stderr limit. Hail does not yet publish a default AWS
-profile, so ``--vep-manifest`` or ``emr/vep_grch38_manifest`` is required.
+executor concurrency, process timeout, and stderr limit. Supported regions are validated against
+botocore's endpoint metadata for the EMR service. Before a real launch, hailctl compares the private
+ECR registry and S3 bucket locations with the cluster region and warns when cross-region transfer
+charges may apply; this warning does not reject an intentionally cross-region profile. Hail does not
+yet publish a default AWS profile, so ``--vep-manifest`` or ``emr/vep_grch38_manifest`` is required.
 
 VEP clusters default to the profile's memory-optimized core instance type, one VEP process per
 executor, and 200 GiB gp3 storage on primary and core nodes. Explicit ``--core-instance-type`` values
 are retained. The base bootstrap establishes ``/vep_data`` as a link to ``/mnt/vep_data`` before
 installing any resources, so the cache and LoFTEE data use the profile-sized volume from the start
-and no later copy/delete migration is required. Large cache and plugin archives stream from S3 through
-a SHA256-verifying pass-through process directly into ``tar`` on the final volume, avoiding a second
-full archive copy. A mismatch fails the bootstrap before the cluster becomes ready or VEP is invoked.
-Small configuration and executable-support resources are staged and verified before installation.
+and no later copy/delete migration is required. Large reference datasets such as the VEP cache, GERP,
+ancestor FASTA, and LoFTEE SQL stream from S3 through a SHA256-verifying pass-through process directly
+to their final paths, avoiding a second full copy. A mismatch fails the bootstrap before the cluster
+becomes ready or VEP is invoked. The LoFTEE plugin archive, VEP configuration, and executable shim are
+small code-bearing resources; they are staged and verified before extraction or installation.
 
 The Hail wheel, bundled JAR, bootstrap scripts, VEP configuration, and container image remain the
 code-bearing artifacts governed by the exact Hail artifact and profile contracts. Checksums on large

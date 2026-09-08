@@ -515,6 +515,27 @@ def test_start_vep_uploads_three_content_addressed_bootstraps(emr_client_mock, u
     assert any('/bootstrap/install-loftee-emr-' in path for path in uploaded_paths)
 
 
+def test_start_vep_warns_for_cross_region_s3(monkeypatch, emr_client_mock):
+    monkeypatch.setattr('hailtop.hailctl.emr.emr.s3_bucket_region', lambda bucket: 'us-west-2')
+    emr_client_mock.run_job_flow.return_value = {'JobFlowId': 'j-vep'}
+    res = runner.invoke(
+        cli.app,
+        [
+            'start',
+            'vep-cluster',
+            '--s3-scratch',
+            's3://bkt/tmp/',
+            '--vep',
+            'GRCh38',
+            '--vep-manifest',
+            'vep-profile.json',
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert "S3 bucket 'vep-profile'" in res.output
+    assert 'cross-region transfer charges may apply' in res.output
+
+
 def test_start_rejects_unsupported_vep_reference(emr_client_mock):
     res = runner.invoke(
         cli.app,

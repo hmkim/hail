@@ -41,7 +41,26 @@ fi
 install -d -o root -g root -m 0755 "$VEP_ROOT"
 ln -s "$VEP_ROOT" /vep_data
 WORKDIR=$(mktemp -d /mnt/vep-emr-bootstrap.XXXXXX)
-trap 'rm -rf -- "$WORKDIR"' EXIT
+
+is_private_ecr_registry() {
+  [[ "$REGISTRY" == *.dkr.ecr.*.amazonaws.com || "$REGISTRY" == *.dkr.ecr.*.amazonaws.com.cn ]]
+}
+
+cleanup_registry_credentials() {
+  if is_private_ecr_registry && command -v docker >/dev/null 2>&1; then
+    docker logout "$REGISTRY" >/dev/null 2>&1 || true
+  fi
+  rm -f /root/.docker/config.json
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  cleanup_registry_credentials
+  rm -rf -- "$WORKDIR"
+  exit "$status"
+}
+trap cleanup EXIT
 CONFIG_STAGED=${WORKDIR}/vep113-GRCh38-base.json
 
 stream_verify_sha256() {
@@ -90,15 +109,12 @@ with open(path, 'w') as f:
 PY
 chmod -R a+rX "$VEP_ROOT"
 
-if [[ "$REGISTRY" == *.dkr.ecr.*.amazonaws.com ]]; then
+if is_private_ecr_registry; then
   aws ecr get-login-password --region "$REGION" \
     | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
 fi
 docker pull "$IMAGE_URI"
-if [[ "$REGISTRY" == *.dkr.ecr.*.amazonaws.com ]]; then
-  docker logout "$REGISTRY" >/dev/null || true
-fi
-rm -f /root/.docker/config.json
+cleanup_registry_credentials
 
 mkdir -p /usr/local/libexec
 cat > /usr/local/libexec/vep-emr-root <<EOF

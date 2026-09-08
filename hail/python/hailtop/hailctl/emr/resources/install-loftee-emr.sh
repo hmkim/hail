@@ -37,9 +37,15 @@ fi
 WORKDIR=$(mktemp -d /mnt/loftee-emr-bootstrap.XXXXXX)
 trap 'rm -rf -- "$WORKDIR"' EXIT
 MANIFEST=$WORKDIR/SHA256SUMS
-RESOURCE_SUMS=$WORKDIR/SHA256SUMS.resources
 LOFTEE_ARCHIVE_NAME=loftee-v1.0.4_GRCh38.tar.gz
-LOFTEE_ARCHIVE_SHA256=
+VEP_CONFIG_NAME=vep113-GRCh38-loftee-emr.json
+SAMTOOLS_SHIM_NAME=samtools-faidx-shim
+GERP_NAME=gerp_conservation_scores.homo_sapiens.GRCh38.bw
+ANCESTOR_NAME=human_ancestor.fa.gz
+ANCESTOR_FAI_NAME=human_ancestor.fa.gz.fai
+ANCESTOR_GZI_NAME=human_ancestor.fa.gz.gzi
+LOFTEE_SQL_NAME=loftee.sql.gz
+declare -A RESOURCE_SHA256
 install -d -o root -g root -m 0755 \
   "$VEP_ROOT/loftee" "$VEP_ROOT/loftee_data" "$VEP_ROOT/bin" /usr/local/libexec
 
@@ -63,38 +69,60 @@ if actual != expected:
 
 aws s3 cp "$PREFIX/SHA256SUMS" "$MANIFEST" --only-show-errors
 printf '%s  %s\n' "$MANIFEST_SHA256" "$MANIFEST" | sha256sum -c -
-: > "$RESOURCE_SUMS"
 
 while read -r checksum filename; do
   [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
   filename=${filename#\*}
   case "$filename" in
-    /*|../*|*/../*|*/..) echo "LoFTEE manifest contains an unsafe path: $filename" >&2; exit 1;;
+    "$LOFTEE_ARCHIVE_NAME"|"$VEP_CONFIG_NAME"|"$SAMTOOLS_SHIM_NAME"|\
+    "$GERP_NAME"|"$ANCESTOR_NAME"|"$ANCESTOR_FAI_NAME"|"$ANCESTOR_GZI_NAME"|"$LOFTEE_SQL_NAME") ;;
+    *) echo "LoFTEE manifest contains an unexpected path: $filename" >&2; exit 1;;
   esac
-  if [[ "$filename" == "$LOFTEE_ARCHIVE_NAME" ]]; then
-    LOFTEE_ARCHIVE_SHA256=$checksum
-    continue
-  fi
-  destination=$WORKDIR/$filename
-  mkdir -p "$(dirname "$destination")"
-  aws s3 cp "$PREFIX/$filename" "$destination" --only-show-errors
-  printf '%s  %s\n' "$checksum" "$filename" >> "$RESOURCE_SUMS"
+  RESOURCE_SHA256["$filename"]=$checksum
 done < "$MANIFEST"
-[[ "$LOFTEE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-( cd "$WORKDIR" && sha256sum -c SHA256SUMS.resources )
 
-# Stream the large plugin archive to its final directory. The verified manifest supplies its digest.
-aws s3 cp "$PREFIX/$LOFTEE_ARCHIVE_NAME" - --only-show-errors \
-  | stream_verify_sha256 "$LOFTEE_ARCHIVE_SHA256" \
-  | tar --no-same-owner --no-same-permissions -xzf - \
-      -C "$VEP_ROOT/loftee" --strip-components=1
-install -m 0644 "$WORKDIR/gerp_conservation_scores.homo_sapiens.GRCh38.bw" "$VEP_ROOT/loftee_data/"
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz" "$VEP_ROOT/loftee_data/"
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz.fai" "$VEP_ROOT/loftee_data/"
-install -m 0644 "$WORKDIR/human_ancestor.fa.gz.gzi" "$VEP_ROOT/loftee_data/"
-gzip -dc "$WORKDIR/loftee.sql.gz" > "$VEP_ROOT/loftee_data/loftee.sql"
-install -m 0755 "$WORKDIR/samtools-faidx-shim" "$VEP_ROOT/bin/samtools"
-install -m 0644 "$WORKDIR/vep113-GRCh38-loftee-emr.json" "$VEP_ROOT/vep.json"
+for filename in \
+  "$LOFTEE_ARCHIVE_NAME" "$VEP_CONFIG_NAME" "$SAMTOOLS_SHIM_NAME" \
+  "$GERP_NAME" "$ANCESTOR_NAME" "$ANCESTOR_FAI_NAME" "$ANCESTOR_GZI_NAME" "$LOFTEE_SQL_NAME"
+do
+  [[ "${RESOURCE_SHA256[$filename]:-}" =~ ^[0-9a-f]{64}$ ]]
+done
+
+# These resources contain executable code or its command configuration. Stage and verify them first.
+for filename in "$LOFTEE_ARCHIVE_NAME" "$VEP_CONFIG_NAME" "$SAMTOOLS_SHIM_NAME"; do
+  aws s3 cp "$PREFIX/$filename" "$WORKDIR/$filename" --only-show-errors
+  printf '%s  %s\n' "${RESOURCE_SHA256[$filename]}" "$WORKDIR/$filename" | sha256sum -c -
+done
+if tar -tzf "$WORKDIR/$LOFTEE_ARCHIVE_NAME" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+  echo "LoFTEE plugin archive contains an unsafe path" >&2
+  exit 1
+fi
+tar --no-same-owner --no-same-permissions -xzf "$WORKDIR/$LOFTEE_ARCHIVE_NAME" \
+  -C "$VEP_ROOT/loftee" --strip-components=1
+install -m 0755 "$WORKDIR/$SAMTOOLS_SHIM_NAME" "$VEP_ROOT/bin/samtools"
+install -m 0644 "$WORKDIR/$VEP_CONFIG_NAME" "$VEP_ROOT/vep.json"
+
+# Large reference datasets stream directly to their final paths while retaining provenance checks.
+aws s3 cp "$PREFIX/$GERP_NAME" - --only-show-errors \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}" \
+  > "$VEP_ROOT/loftee_data/$GERP_NAME"
+aws s3 cp "$PREFIX/$ANCESTOR_NAME" - --only-show-errors \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_NAME]}" \
+  > "$VEP_ROOT/loftee_data/$ANCESTOR_NAME"
+aws s3 cp "$PREFIX/$ANCESTOR_FAI_NAME" - --only-show-errors \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_FAI_NAME]}" \
+  > "$VEP_ROOT/loftee_data/$ANCESTOR_FAI_NAME"
+aws s3 cp "$PREFIX/$ANCESTOR_GZI_NAME" - --only-show-errors \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_GZI_NAME]}" \
+  > "$VEP_ROOT/loftee_data/$ANCESTOR_GZI_NAME"
+aws s3 cp "$PREFIX/$LOFTEE_SQL_NAME" - --only-show-errors \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$LOFTEE_SQL_NAME]}" \
+  | gzip -dc > "$VEP_ROOT/loftee_data/loftee.sql"
+chmod 0644 "$VEP_ROOT/loftee_data/$GERP_NAME" \
+  "$VEP_ROOT/loftee_data/$ANCESTOR_NAME" \
+  "$VEP_ROOT/loftee_data/$ANCESTOR_FAI_NAME" \
+  "$VEP_ROOT/loftee_data/$ANCESTOR_GZI_NAME" \
+  "$VEP_ROOT/loftee_data/loftee.sql"
 python3.12 - "$VEP_ROOT/vep.json" "$PROCESS_TIMEOUT_SECONDS" "$STDERR_MAX_BYTES" <<'PY'
 import json
 import sys

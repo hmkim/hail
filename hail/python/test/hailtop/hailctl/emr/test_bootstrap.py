@@ -27,6 +27,8 @@ def test_vep_bootstraps_use_only_scoped_docker_wrapper():
     assert 'exec sudo -n /usr/local/libexec/vep-emr-root "$@"' in combined
     assert ':ro' in base
     assert ':ro' in loftee
+    assert 'cleanup_registry_credentials' in base
+    assert 'trap cleanup EXIT' in base
     assert 'docker logout' in base
     assert 'rm -f /root/.docker/config.json' in base
 
@@ -54,8 +56,11 @@ def test_vep_bootstraps_inject_process_controls_and_have_valid_shell_syntax():
     assert 'mktemp -d /mnt/loftee-emr-bootstrap.XXXXXX' in loftee
     assert 'WORKDIR=/mnt1/' not in loftee
     assert 'LOFTEE_ARCHIVE_NAME=loftee-v1.0.4_GRCh38.tar.gz' in loftee
-    assert 'aws s3 cp "$PREFIX/$LOFTEE_ARCHIVE_NAME" - --only-show-errors' in loftee
-    assert '| stream_verify_sha256 "$LOFTEE_ARCHIVE_SHA256"' in loftee
+    assert '"$LOFTEE_ARCHIVE_NAME" "$VEP_CONFIG_NAME" "$SAMTOOLS_SHIM_NAME"' in loftee
+    assert 'sha256sum -c -' in loftee
+    assert 'aws s3 cp "$PREFIX/$GERP_NAME" - --only-show-errors' in loftee
+    assert '| stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}"' in loftee
+    assert 'aws s3 cp "$PREFIX/$ANCESTOR_NAME" - --only-show-errors' in loftee
     assert 'cp -a /vep_data' not in loftee
     assert 'rm -rf /vep_data' not in loftee
     assert 'ln -sfn /mnt/vep_data /vep_data' not in loftee
