@@ -29,6 +29,8 @@ case class VEPConfiguration(
   command: Array[String],
   env: Map[String, String],
   vep_json_schema: TStruct,
+  process_timeout_seconds: Option[Long] = None,
+  stderr_max_bytes: Option[Int] = None,
 )
 
 object VEP {
@@ -36,7 +38,16 @@ object VEP {
   def readConfiguration(fs: FS, path: String): VEPConfiguration = {
     val jv = using(fs.open(path))(in => JsonMethods.parse(in))
     implicit val formats: Formats = DefaultFormats + new TStructSerializer
-    jv.extract[VEPConfiguration]
+    val configuration = jv.extract[VEPConfiguration]
+    configuration.process_timeout_seconds.foreach { value =>
+      if (value <= 0)
+        fatal(s"VEP process_timeout_seconds must be positive, found $value")
+    }
+    configuration.stderr_max_bytes.foreach { value =>
+      if (value <= 0)
+        fatal(s"VEP stderr_max_bytes must be positive, found $value")
+    }
+    configuration
   }
 
   def apply(fs: FS, params: VEPParameters): VEP =
@@ -56,6 +67,10 @@ case class VEPParameters(config: String, csq: Boolean, blockSize: Int, tolerateP
 
 class VEP(private val params: VEPParameters, conf: VEPConfiguration)
     extends TableToTableFunction with Logging with Serializable {
+
+  private val processTimeoutMillis: Long =
+    conf.process_timeout_seconds.map(seconds => Math.multiplyExact(seconds, 1000L)).getOrElse(0L)
+  private val maxStderrBytes: Int = conf.stderr_max_bytes.getOrElse(Int.MaxValue)
 
   override def preservesPartitionCounts: Boolean = false
 
@@ -105,7 +120,14 @@ class VEP(private val params: VEPParameters, conf: VEPConfiguration)
           .zipWithIndex
           .flatMap { case (block, blockIdx) =>
             val procID = Annotation(partIdx, blockIdx)
-            val (jt, err, proc) = block.iterator.pipe(pb, printContext, printElement, _ => ())
+            val (jt, err, proc) = block.iterator.pipe(
+              pb,
+              printContext,
+              printElement,
+              _ => (),
+              timeoutMillis = processTimeoutMillis,
+              maxStderrBytes = maxStderrBytes,
+            )
 
             val nonStarToOriginalVariant =
               block
@@ -288,7 +310,14 @@ class VEP(private val params: VEPParameters, conf: VEPConfiguration)
     val (jt, err, proc) =
       Iterator
         .single((Locus("1", 13372), FastSeq("G", "C")))
-        .pipe(pb, printContext, printElement, _ => ())
+        .pipe(
+          pb,
+          printContext,
+          printElement,
+          _ => (),
+          timeoutMillis = processTimeoutMillis,
+          maxStderrBytes = maxStderrBytes,
+        )
 
     val csqHeader = jt.flatMap(csqHeaderRegex.findFirstMatchIn(_).map(_.group(1)))
     waitFor(proc, err, cmd)

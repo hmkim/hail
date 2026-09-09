@@ -127,4 +127,66 @@ reserve YARN container memory or automatically change ``spark.executor.memoryOve
 Variant Effect Predictor (VEP)
 ------------------------------
 
-VEP on EMR is not supported in this initial Spark 4 release.
+VEP and LoFTEE can be installed when creating a GRCh38 cluster:
+
+.. code-block:: text
+
+    hailctl emr start NAME ... \
+        --vep GRCh38 \
+        --vep-manifest ./vep-grch38-profile.json
+
+The profile can instead be configured once:
+
+.. code-block:: text
+
+    hailctl config set emr/vep_grch38_manifest ./vep-grch38-profile.json
+    hailctl emr start NAME ... --vep GRCh38
+
+After the cluster is ready, Hail discovers the node-local configuration automatically, matching the
+Dataproc experience:
+
+.. code-block:: python
+
+    annotated = hl.vep(dataset)
+
+The initial EMR implementation supports only GRCh38 and requires an immutable profile supplied by the
+operator. The profile pins the VEP and LoFTEE versions, supported AWS regions, container image digest,
+S3 cache/config/reference locations and SHA256 checksums, storage size, instance recommendation,
+executor concurrency, process timeout, and stderr limit. Supported regions are validated against
+botocore's endpoint metadata for the EMR service. Before a real launch, hailctl compares the private
+ECR registry and S3 bucket locations with the cluster region and warns when cross-region transfer
+charges may apply; this warning does not reject an intentionally cross-region profile. Hail does not
+yet publish a default AWS profile, so ``--vep-manifest`` or ``emr/vep_grch38_manifest`` is required.
+
+VEP clusters default to the profile's memory-optimized core instance type, one VEP process per
+executor, and 200 GiB gp3 storage on primary and core nodes. Explicit ``--core-instance-type`` values
+are retained. The base bootstrap establishes ``/vep_data`` as a link to ``/mnt/vep_data`` before
+installing any resources, so the cache and LoFTEE data use the profile-sized volume from the start
+and no later copy/delete migration is required. The VEP cache archive is staged temporarily on the
+profile-sized volume, checked against both its expected byte count and SHA256 digest, and validated for
+safe member paths and types before extraction. Large non-archive LoFTEE references such as GERP, the
+ancestor FASTA, and the compressed SQL database stream from S3 through a SHA256-verifying pass-through
+process to their final paths. Their verified compressed byte counts, together with the staged plugin,
+configuration, and shim sizes, must equal the profile's expected LoFTEE resource size. A mismatch fails
+the bootstrap before the cluster becomes ready or VEP is invoked. The LoFTEE plugin archive, VEP
+configuration, and executable shim are staged and verified before extraction or installation.
+
+The Hail wheel, bundled JAR, bootstrap scripts, VEP configuration, cache archive, LoFTEE plugin, and
+container image are governed by the exact Hail artifact and profile contracts. Cache and LoFTEE data
+are installed on every node at cluster creation; an existing cluster cannot be retrofitted and must be
+recreated with ``--vep``.
+
+The bootstrap runs a container pinned by digest behind a root-owned wrapper with fixed read-only
+mounts. The EMR driver user (``hadoop``) and YARN executor user (``yarn``) may invoke only that wrapper;
+they are not added to the Docker group. Normal Hail execution obtains the wrapper argument vector from
+the checksum-verified, root-installed VEP configuration and streams variant records over standard
+input; variant data is not evaluated as shell or Docker arguments. The wrapper fixes the image,
+executable, and host paths and validates the complete VEP argument vector against the installed GRCh38
+profile. Only the JSON-versus-CSQ output flag may vary. Arguments that do not exactly match the base or
+LoFTEE profile contract are rejected before Docker starts.
+
+This strict contract intentionally rejects custom VEP commands on a cluster created with ``--vep``.
+Operators who need a different command or plugin set must publish and review a separate profile rather
+than reuse the privileged wrapper. Registry credentials are removed after image installation. Advanced
+request overlays must retain both checksum-verified VEP bootstraps and the automatic
+``VEP_CONFIG_URI`` settings.

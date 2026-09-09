@@ -2,6 +2,7 @@ import pytest
 
 from hailtop.hailctl.emr import start
 from hailtop.hailctl.emr.artifact import HailArtifactManifest
+from hailtop.hailctl.emr.vep import VEPProfileManifest
 
 
 def artifact_manifest(**overrides):
@@ -19,6 +20,30 @@ def artifact_manifest(**overrides):
     }
     values.update(overrides)
     return HailArtifactManifest(**values)
+
+
+def vep_profile():
+    return VEPProfileManifest(
+        schema_version=1,
+        reference_genome='GRCh38',
+        vep_version='113.4',
+        loftee_version='1.0.4_GRCh38',
+        supported_regions=['us-east-1'],
+        image_uri='public.ecr.aws/example/vep@sha256:' + 'd' * 64,
+        cache_uri='s3://vep/cache.tar.gz',
+        cache_sha256='e' * 64,
+        cache_size_bytes=25_000_000_000,
+        base_config_uri='s3://vep/base.json',
+        base_config_sha256='f' * 64,
+        loftee_resource_prefix_uri='s3://vep/loftee/',
+        loftee_manifest_sha256='1' * 64,
+        loftee_size_bytes=14_000_000_000,
+        storage_size_gb=200,
+        recommended_core_instance_type='r5.2xlarge',
+        executor_cores=1,
+        process_timeout_seconds=600,
+        stderr_max_bytes=1_048_576,
+    )
 
 
 def test_default_release_matches_hail_spark_minor():
@@ -157,3 +182,97 @@ def test_build_run_job_flow_kwargs_shape():
     igs = {g['InstanceRole']: g for g in kwargs['Instances']['InstanceGroups']}
     assert igs['MASTER']['Name'] == 'Primary'
     assert igs['CORE']['InstanceCount'] == 2
+
+
+def test_hail_configurations_set_vep_environment_and_concurrency():
+    profile = vep_profile()
+    configurations = start.hail_configurations(off_heap_memory_per_core_mb=1024, vep_profile=profile)
+    spark_defaults = next(c for c in configurations if c['Classification'] == 'spark-defaults')['Properties']
+    assert spark_defaults['spark.executorEnv.VEP_CONFIG_URI'] == start.VEP_CONFIG_URI
+    assert spark_defaults['spark.yarn.appMasterEnv.VEP_CONFIG_URI'] == start.VEP_CONFIG_URI
+    assert spark_defaults['spark.executor.cores'] == '1'
+    spark_env = next(c for c in configurations if c['Classification'] == 'spark-env')
+    export = next(c for c in spark_env['Configurations'] if c['Classification'] == 'export')['Properties']
+    assert export['VEP_CONFIG_URI'] == start.VEP_CONFIG_URI
+    start.validate_vep_configurations(configurations, profile)
+
+
+def test_validate_vep_configurations_rejects_overlay_removal():
+    profile = vep_profile()
+    configurations = start.hail_configurations(off_heap_memory_per_core_mb=None, vep_profile=profile)
+    spark_defaults = next(c for c in configurations if c['Classification'] == 'spark-defaults')['Properties']
+    del spark_defaults['spark.executorEnv.VEP_CONFIG_URI']
+    with pytest.raises(ValueError, match='spark.executorEnv.VEP_CONFIG_URI'):
+        start.validate_vep_configurations(configurations, profile)
+
+
+def test_build_run_job_flow_kwargs_adds_vep_bootstraps_storage_and_tags():
+    profile = vep_profile()
+    vep_actions = [
+        {'Name': 'install-vep', 'ScriptBootstrapAction': {'Path': 's3://bkt/vep.sh', 'Args': ['vep']}},
+        {'Name': 'install-loftee', 'ScriptBootstrapAction': {'Path': 's3://bkt/loftee.sh', 'Args': ['loftee']}},
+    ]
+    kwargs = start.build_run_job_flow_kwargs(
+        cluster_name='vep',
+        release_label='emr-spark-8.1.0',
+        master_instance_type='m5.xlarge',
+        core_instance_type='r5.2xlarge',
+        core_instance_count=2,
+        ec2_key_name=None,
+        subnet_id='subnet-1',
+        service_access_security_group='sg-service',
+        primary_security_group='sg-primary',
+        core_security_group='sg-core',
+        log_uri='s3://bkt/logs/',
+        bootstrap_s3_uri='s3://bkt/hail.sh',
+        artifact=artifact_manifest(),
+        off_heap_memory_per_core_mb=1024,
+        use_default_roles=True,
+        service_role=None,
+        instance_profile=None,
+        idle_timeout=3600,
+        vep_profile=profile,
+        vep_bootstrap_actions=vep_actions,
+    )
+    assert [action['Name'] for action in kwargs['BootstrapActions']] == [
+        'install-hail',
+        'install-vep',
+        'install-loftee',
+    ]
+    for group in kwargs['Instances']['InstanceGroups']:
+        ebs = group['EbsConfiguration']
+        assert ebs['EbsOptimized'] is True
+        assert ebs['EbsBlockDeviceConfigs'][0]['VolumeSpecification'] == {
+            'VolumeType': 'gp3',
+            'SizeInGB': 200,
+        }
+    tags = {tag['Key']: tag['Value'] for tag in kwargs['Tags']}
+    assert tags['hail-vep-reference-genome'] == 'GRCh38'
+    assert tags['hail-vep-version'] == '113.4'
+    assert tags['hail-loftee-version'] == '1.0.4_GRCh38'
+
+
+def test_build_run_job_flow_kwargs_rejects_partial_vep_bootstraps():
+    with pytest.raises(ValueError, match='exactly two'):
+        start.build_run_job_flow_kwargs(
+            cluster_name='vep',
+            release_label='emr-spark-8.1.0',
+            master_instance_type='m5.xlarge',
+            core_instance_type='r5.2xlarge',
+            core_instance_count=1,
+            ec2_key_name=None,
+            subnet_id='subnet-1',
+            service_access_security_group='sg-service',
+            primary_security_group='sg-primary',
+            core_security_group='sg-core',
+            log_uri='s3://bkt/logs/',
+            bootstrap_s3_uri='s3://bkt/hail.sh',
+            artifact=artifact_manifest(),
+            off_heap_memory_per_core_mb=None,
+            use_default_roles=True,
+            service_role=None,
+            instance_profile=None,
+            idle_timeout=3600,
+            vep_profile=vep_profile(),
+            vep_bootstrap_actions=[],
+        )

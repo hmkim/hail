@@ -29,6 +29,20 @@ def test_resolve_region_none_when_unset(monkeypatch):
         assert emr.resolve_region(None) is None
 
 
+def test_s3_bucket_region_normalizes_special_locations():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.get_bucket_location.side_effect = [
+        {'LocationConstraint': None},
+        {'LocationConstraint': 'EU'},
+        {'LocationConstraint': 'ap-northeast-2'},
+    ]
+    assert emr.s3_bucket_region('east', client) == 'us-east-1'
+    assert emr.s3_bucket_region('legacy-eu', client) == 'eu-west-1'
+    assert emr.s3_bucket_region('seoul', client) == 'ap-northeast-2'
+
+
 def _fake_iam(existing_roles, existing_instance_profiles):
     from unittest.mock import MagicMock
 

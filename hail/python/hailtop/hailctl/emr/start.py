@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .artifact import HailArtifactManifest, major_minor
+from .vep import VEPProfileManifest
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ S3A_CORE_SITE_PROPERTIES = {
 DEFAULT_EMR_RELEASE = 'emr-spark-8.1.0'
 HAIL_JAR_PATH = '/usr/lib/hail/hail-all-spark.jar'
 EMR_PYSPARK_PYTHON = '/usr/bin/python3.12'
+VEP_CONFIG_URI = 'file:///vep_data/vep.json'
 
 
 def release_config(release_label: str) -> EMRReleaseConfig:
@@ -86,7 +88,9 @@ def validate_artifact_compatibility(
         )
 
 
-def hail_configurations(off_heap_memory_per_core_mb: Optional[int]) -> list[dict]:
+def hail_configurations(
+    off_heap_memory_per_core_mb: Optional[int], vep_profile: Optional[VEPProfileManifest] = None
+) -> list[dict]:
     spark_defaults = {
         'spark.jars': f'local://{HAIL_JAR_PATH}',
         'spark.driver.extraClassPath': HAIL_JAR_PATH,
@@ -102,24 +106,25 @@ def hail_configurations(off_heap_memory_per_core_mb: Optional[int]) -> list[dict
         'spark.yarn.appMasterEnv.HAIL_CLOUD': 'aws',
         'spark.pyspark.python': EMR_PYSPARK_PYTHON,
     }
+    spark_env_export = {
+        'HAIL_CLOUD': 'aws',
+        'PYSPARK_PYTHON': EMR_PYSPARK_PYTHON,
+        'SPARK_DIST_CLASSPATH': '$(hadoop classpath)',
+    }
     if off_heap_memory_per_core_mb is not None:
         spark_defaults['spark.executorEnv.HAIL_WORKER_OFF_HEAP_MEMORY_PER_CORE_MB'] = str(off_heap_memory_per_core_mb)
+    if vep_profile is not None:
+        spark_defaults['spark.executorEnv.VEP_CONFIG_URI'] = VEP_CONFIG_URI
+        spark_defaults['spark.yarn.appMasterEnv.VEP_CONFIG_URI'] = VEP_CONFIG_URI
+        spark_defaults['spark.executor.cores'] = str(vep_profile.executor_cores)
+        spark_env_export['VEP_CONFIG_URI'] = VEP_CONFIG_URI
     return [
         {'Classification': 'core-site', 'Properties': copy.deepcopy(S3A_CORE_SITE_PROPERTIES)},
         {'Classification': 'spark-defaults', 'Properties': spark_defaults},
         {'Classification': 'spark', 'Properties': {'maximizeResourceAllocation': 'true'}},
         {
             'Classification': 'spark-env',
-            'Configurations': [
-                {
-                    'Classification': 'export',
-                    'Properties': {
-                        'HAIL_CLOUD': 'aws',
-                        'PYSPARK_PYTHON': EMR_PYSPARK_PYTHON,
-                        'SPARK_DIST_CLASSPATH': '$(hadoop classpath)',
-                    },
-                }
-            ],
+            'Configurations': [{'Classification': 'export', 'Properties': spark_env_export}],
             'Properties': {},
         },
     ]
@@ -148,6 +153,74 @@ def deep_merge(base: dict, overlay: dict) -> dict:
         else:
             result[key] = copy.deepcopy(value)
     return result
+
+
+def validate_vep_configurations(configurations: object, profile: VEPProfileManifest) -> None:
+    if not isinstance(configurations, list):
+        raise ValueError('The final RunJobFlow Configurations value must be a list.')
+    spark_defaults: dict = {}
+    spark_env_export: dict = {}
+    for configuration in configurations:
+        if not isinstance(configuration, dict):
+            continue
+        if configuration.get('Classification') == 'spark-defaults':
+            properties = configuration.get('Properties')
+            if isinstance(properties, dict):
+                spark_defaults.update(properties)
+        if configuration.get('Classification') == 'spark-env':
+            nested = configuration.get('Configurations')
+            if isinstance(nested, list):
+                for child in nested:
+                    if isinstance(child, dict) and child.get('Classification') == 'export':
+                        properties = child.get('Properties')
+                        if isinstance(properties, dict):
+                            spark_env_export.update(properties)
+    required = {
+        'spark.executorEnv.VEP_CONFIG_URI': VEP_CONFIG_URI,
+        'spark.yarn.appMasterEnv.VEP_CONFIG_URI': VEP_CONFIG_URI,
+        'spark.executor.cores': str(profile.executor_cores),
+    }
+    for name, expected in required.items():
+        if spark_defaults.get(name) != expected:
+            raise ValueError(f'The final spark-defaults configuration must set {name}={expected}.')
+    if spark_env_export.get('VEP_CONFIG_URI') != VEP_CONFIG_URI:
+        raise ValueError(f'The final spark-env export must set VEP_CONFIG_URI={VEP_CONFIG_URI}.')
+
+
+def validate_vep_instances(instances: object, profile: VEPProfileManifest) -> None:
+    if not isinstance(instances, dict):
+        raise ValueError('The final RunJobFlow Instances value must be a JSON object.')
+    if 'InstanceFleets' in instances:
+        raise ValueError('VEP initially supports InstanceGroups only, not InstanceFleets.')
+    groups = instances.get('InstanceGroups')
+    if not isinstance(groups, list):
+        raise ValueError('The final VEP request must contain InstanceGroups.')
+    roles = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError('Every VEP instance group must be a JSON object.')
+        role = group.get('InstanceRole')
+        if role not in {'MASTER', 'CORE', 'TASK'}:
+            raise ValueError(f'Unsupported VEP instance group role: {role!r}.')
+        roles.add(role)
+        ebs = group.get('EbsConfiguration')
+        configs = ebs.get('EbsBlockDeviceConfigs') if isinstance(ebs, dict) else None
+        if not isinstance(configs, list):
+            raise ValueError(f'VEP instance group {role} must configure EBS storage.')
+        total_size_gb = 0
+        for config in configs:
+            if not isinstance(config, dict):
+                continue
+            volume = config.get('VolumeSpecification')
+            count = config.get('VolumesPerInstance', 1)
+            if isinstance(volume, dict) and isinstance(volume.get('SizeInGB'), int) and isinstance(count, int):
+                total_size_gb += volume['SizeInGB'] * count
+        if total_size_gb < profile.storage_size_gb:
+            raise ValueError(
+                f'VEP instance group {role} must have at least {profile.storage_size_gb} GiB of EBS storage.'
+            )
+    if not {'MASTER', 'CORE'}.issubset(roles):
+        raise ValueError('The final VEP request must contain primary and core instance groups.')
 
 
 def merge_run_job_flow_overlay(base: dict, overlay: dict) -> dict:
@@ -184,12 +257,14 @@ def build_run_job_flow_kwargs(
     service_role: Optional[str],
     instance_profile: Optional[str],
     idle_timeout: int,
+    vep_profile: Optional[VEPProfileManifest] = None,
+    vep_bootstrap_actions: Optional[list[dict]] = None,
 ) -> dict:
     kwargs: dict = {
         'Name': cluster_name,
         'ReleaseLabel': release_label,
         'Applications': [{'Name': 'Spark'}],
-        'Configurations': hail_configurations(off_heap_memory_per_core_mb),
+        'Configurations': hail_configurations(off_heap_memory_per_core_mb, vep_profile),
         'BootstrapActions': [
             {
                 'Name': 'install-hail',
@@ -224,6 +299,32 @@ def build_run_job_flow_kwargs(
             {'Key': 'hail-spark-version', 'Value': artifact.spark_version},
         ],
     }
+    if vep_profile is not None:
+        if not isinstance(vep_bootstrap_actions, list) or len(vep_bootstrap_actions) != 2:
+            raise ValueError('VEP requires exactly two checksum-verified bootstrap actions.')
+        kwargs['BootstrapActions'].extend(copy.deepcopy(vep_bootstrap_actions))
+        ebs_configuration = {
+            'EbsBlockDeviceConfigs': [
+                {
+                    'VolumeSpecification': {
+                        'VolumeType': 'gp3',
+                        'SizeInGB': vep_profile.storage_size_gb,
+                    },
+                    'VolumesPerInstance': 1,
+                }
+            ],
+            'EbsOptimized': True,
+        }
+        for instance_group in kwargs['Instances']['InstanceGroups']:
+            instance_group['EbsConfiguration'] = copy.deepcopy(ebs_configuration)
+        kwargs['Tags'].extend([
+            {'Key': 'hail-vep-reference-genome', 'Value': vep_profile.reference_genome},
+            {'Key': 'hail-vep-version', 'Value': vep_profile.vep_version},
+            {'Key': 'hail-loftee-version', 'Value': vep_profile.loftee_version},
+        ])
+    elif vep_bootstrap_actions is not None:
+        raise ValueError('VEP bootstrap actions require a VEP profile.')
+
     if log_uri is not None:
         kwargs['LogUri'] = log_uri
     if ec2_key_name is not None:

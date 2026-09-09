@@ -73,7 +73,10 @@ def start(
     region: Ann[Optional[str], Opt(help='AWS region for the cluster.')] = None,
     release_label: Ann[str, Opt(help='EMR release label.')] = 'emr-spark-8.1.0',
     master_instance_type: Ann[str, Opt(help='Instance type for the master node.')] = 'm5.xlarge',
-    core_instance_type: Ann[str, Opt(help='Instance type for core (worker) nodes.')] = 'm5.xlarge',
+    core_instance_type: Ann[
+        Optional[str],
+        Opt(help='Instance type for core (worker) nodes. Defaults to r5.2xlarge with --vep, otherwise m5.xlarge.'),
+    ] = None,
     core_instance_count: Ann[int, Opt(help='Number of core (worker) nodes.')] = 2,
     ec2_key_name: Ann[Optional[str], Opt(help='EC2 key pair name for SSH access.')] = None,
     log_uri: Ann[Optional[str], Opt(help='S3 URI for EMR logs. Defaults to <s3-scratch>/logs/.')] = None,
@@ -97,7 +100,14 @@ def start(
             help='JSON object deep-merged into the boto3 run_job_flow request for advanced options.',
         ),
     ] = None,
-    vep: Ann[Optional[str], Opt(help='(Phase 2) Install VEP for the given reference genome.')] = None,
+    vep: Ann[Optional[str], Opt(help='Install VEP and LoFTEE for the given reference genome (GRCh38 only).')] = None,
+    vep_manifest: Ann[
+        Optional[str],
+        Opt(
+            '--vep-manifest',
+            help='Local immutable VEP profile manifest. Defaults to hailctl config emr/vep_grch38_manifest.',
+        ),
+    ] = None,
     dry_run: Ann[bool, Opt(help="Build the request but don't call AWS.")] = False,
 ):
     """Start an EMR cluster configured for Hail."""
@@ -107,9 +117,12 @@ def start(
     from . import artifact as artifact_mod  # pylint: disable=import-outside-toplevel
     from . import emr  # pylint: disable=import-outside-toplevel
     from . import start as start_mod  # pylint: disable=import-outside-toplevel
+    from . import vep as vep_mod  # pylint: disable=import-outside-toplevel
 
-    if vep is not None:
-        raise NotImplementedError('VEP on EMR is planned for a future release (Phase 2).')
+    if vep is None and vep_manifest is not None:
+        raise typer.BadParameter('--vep-manifest requires --vep GRCh38.')
+    if vep is not None and vep != 'GRCh38':
+        raise typer.BadParameter('--vep currently supports only GRCh38.')
     if idle_timeout < 60 or idle_timeout > 604800:
         raise typer.BadParameter('--idle-timeout must be between 60 and 604800 seconds.')
     try:
@@ -133,10 +146,53 @@ def start(
     resolved_region = emr.resolve_region(region)
     if resolved_region is None:
         raise typer.BadParameter('Provide --region or set `hailctl config set emr/region`.')
-    bootstrap_bytes = _bootstrap_script_bytes()
-    bootstrap_sha256 = hashlib.sha256(bootstrap_bytes).hexdigest()
+
     artifact_prefix = artifact.wheel_uri.rsplit('/', 1)[0]
+    bootstrap_bytes = _resource_script_bytes('install-hail-emr.sh')
+    bootstrap_sha256 = hashlib.sha256(bootstrap_bytes).hexdigest()
     bootstrap_s3_uri = f'{artifact_prefix}/bootstrap/install-hail-emr-{bootstrap_sha256}.sh'
+
+    vep_profile_obj = None
+    vep_bootstrap_actions = None
+    additional_bootstrap_uploads: builtins.list[tuple[str, bytes]] = []
+    if vep is not None:
+        profile_path = configuration_of(ConfigVariable.EMR_VEP_GRCH38_MANIFEST, vep_manifest, None)
+        if profile_path is None:
+            raise typer.BadParameter('Provide --vep-manifest or set `hailctl config set emr/vep_grch38_manifest`.')
+        try:
+            vep_profile_obj = vep_mod.load_vep_profile(profile_path)
+            vep_profile_obj.validate_region(resolved_region)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        _require_s3_uri(vep_profile_obj.cache_uri, 'VEP profile cache_uri')
+        _require_s3_uri(vep_profile_obj.base_config_uri, 'VEP profile base_config_uri')
+        _require_s3_uri(vep_profile_obj.loftee_resource_prefix_uri, 'VEP profile loftee_resource_prefix_uri')
+
+        vep_bytes = _resource_script_bytes('install-vep-emr.sh')
+        loftee_bytes = _resource_script_bytes('install-loftee-emr.sh')
+        vep_s3_uri = f'{artifact_prefix}/bootstrap/install-vep-emr-{hashlib.sha256(vep_bytes).hexdigest()}.sh'
+        loftee_s3_uri = f'{artifact_prefix}/bootstrap/install-loftee-emr-{hashlib.sha256(loftee_bytes).hexdigest()}.sh'
+        vep_bootstrap_actions = [
+            {
+                'Name': 'install-vep-grch38',
+                'ScriptBootstrapAction': {
+                    'Path': vep_s3_uri,
+                    'Args': vep_profile_obj.base_bootstrap_args(resolved_region),
+                },
+            },
+            {
+                'Name': 'install-loftee-grch38',
+                'ScriptBootstrapAction': {
+                    'Path': loftee_s3_uri,
+                    'Args': vep_profile_obj.loftee_bootstrap_args(),
+                },
+            },
+        ]
+        additional_bootstrap_uploads = [(vep_s3_uri, vep_bytes), (loftee_s3_uri, loftee_bytes)]
+
+    resolved_core_instance_type = core_instance_type or (
+        vep_profile_obj.recommended_core_instance_type if vep_profile_obj is not None else 'm5.xlarge'
+    )
     resolved_log_uri = log_uri or (scratch.rstrip('/') + '/logs/')
     _require_s3_uri(resolved_log_uri, '--log-uri')
 
@@ -144,7 +200,7 @@ def start(
         cluster_name=cluster_name,
         release_label=release_label,
         master_instance_type=master_instance_type,
-        core_instance_type=core_instance_type,
+        core_instance_type=resolved_core_instance_type,
         core_instance_count=core_instance_count,
         ec2_key_name=ec2_key_name,
         subnet_id=subnet_id,
@@ -159,6 +215,8 @@ def start(
         service_role=service_role,
         instance_profile=instance_profile,
         idle_timeout=idle_timeout,
+        vep_profile=vep_profile_obj,
+        vep_bootstrap_actions=vep_bootstrap_actions,
     )
 
     if run_job_flow_json is not None:
@@ -190,12 +248,19 @@ def start(
 
     try:
         start_mod.validate_s3a_configurations(kwargs.get('Configurations'))
+        if vep_profile_obj is not None:
+            start_mod.validate_vep_configurations(kwargs.get('Configurations'), vep_profile_obj)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     instances = kwargs.get('Instances')
     if not isinstance(instances, dict):
         raise typer.BadParameter('The final RunJobFlow Instances value must be a JSON object.')
+    if vep_profile_obj is not None:
+        try:
+            start_mod.validate_vep_instances(instances, vep_profile_obj)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     if 'InstanceGroups' in instances and 'InstanceFleets' in instances:
         raise typer.BadParameter('RunJobFlow Instances cannot contain both InstanceGroups and InstanceFleets.')
     final_subnet_id = instances.get('Ec2SubnetId')
@@ -237,10 +302,21 @@ def start(
         raise typer.BadParameter(
             'The final RunJobFlow request must retain the checksum-verified install-hail bootstrap.'
         )
+    if vep_bootstrap_actions is not None:
+        if not isinstance(bootstrap_actions, builtins.list) or any(
+            expected not in bootstrap_actions for expected in vep_bootstrap_actions
+        ):
+            raise typer.BadParameter(
+                'The final RunJobFlow request must retain the checksum-verified VEP and LoFTEE bootstraps.'
+            )
 
     if dry_run:
         print(json.dumps(kwargs, indent=2))
         return
+
+    if vep_profile_obj is not None:
+        for warning in vep_profile_obj.region_warnings(resolved_region, emr.s3_bucket_region):
+            typer.echo(f'Warning: {warning}.', err=True)
 
     final_uses_default_service_role = kwargs.get('ServiceRole') == emr.DEFAULT_SERVICE_ROLE
     final_uses_default_job_flow_role = kwargs.get('JobFlowRole') == emr.DEFAULT_JOB_FLOW_ROLE
@@ -261,14 +337,16 @@ def start(
     )
 
     _upload_bootstrap(bootstrap_s3_uri, bootstrap_bytes)
+    for additional_uri, additional_bytes in additional_bootstrap_uploads:
+        _upload_bootstrap(additional_uri, additional_bytes)
     resp = emr.emr_client(resolved_region).run_job_flow(**kwargs)
     print(f"Started cluster {resp['JobFlowId']}.")
 
 
-def _bootstrap_script_bytes() -> bytes:
+def _resource_script_bytes(resource_name: str) -> bytes:
     import importlib.resources as ir  # pylint: disable=import-outside-toplevel
 
-    return ir.files('hailtop.hailctl.emr').joinpath('resources/install-hail-emr.sh').read_bytes()
+    return ir.files('hailtop.hailctl.emr').joinpath(f'resources/{resource_name}').read_bytes()
 
 
 def _upload_bootstrap(bootstrap_s3_uri: str, script_bytes: bytes) -> None:
