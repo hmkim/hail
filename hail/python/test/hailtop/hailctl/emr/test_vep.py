@@ -15,10 +15,12 @@ def profile_dict(**overrides):
         'image_uri': 'public.ecr.aws/example/vep@sha256:' + 'a' * 64,
         'cache_uri': 's3://example/vep/cache.tar.gz',
         'cache_sha256': 'b' * 64,
+        'cache_size_bytes': 25_000_000_000,
         'base_config_uri': 's3://example/vep/base-config.json',
         'base_config_sha256': 'c' * 64,
         'loftee_resource_prefix_uri': 's3://example/vep/loftee/',
         'loftee_manifest_sha256': 'd' * 64,
+        'loftee_size_bytes': 14_000_000_000,
         'storage_size_gb': 200,
         'recommended_core_instance_type': 'r5.2xlarge',
         'executor_cores': 1,
@@ -35,7 +37,9 @@ def test_profile_parses_and_builds_bootstrap_args(tmp_path):
     profile = load_vep_profile(str(path))
     assert profile.reference_genome == 'GRCh38'
     base_args = profile.base_bootstrap_args('us-east-1')
+    assert base_args[2] == '25000000000'
     assert base_args[-3:] == ['us-east-1', '600', '1048576']
+    assert profile.loftee_bootstrap_args()[3] == '14000000000'
     assert profile.loftee_bootstrap_args()[-2:] == ['600', '1048576']
     assert profile.loftee_bootstrap_args()[0] == 's3://example/vep/loftee'
 
@@ -53,6 +57,9 @@ def test_profile_parses_and_builds_bootstrap_args(tmp_path):
         ({'image_uri': 123}, 'immutable sha256'),
         ({'cache_uri': 'https://example/cache'}, 's3://'),
         ({'cache_sha256': 'bad'}, 'SHA256'),
+        ({'cache_size_bytes': 0}, 'positive integer'),
+        ({'cache_size_bytes': True}, 'positive integer'),
+        ({'loftee_size_bytes': 0}, 'positive integer'),
         ({'storage_size_gb': 99}, 'at least 100'),
         ({'executor_cores': 0}, 'positive integer'),
         ({'executor_cores': True}, 'positive integer'),

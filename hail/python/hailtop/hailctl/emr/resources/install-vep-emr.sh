@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ $# -ne 8 ]]; then
-  echo "usage: $0 CACHE_URI CACHE_SHA256 CONFIG_URI CONFIG_SHA256 IMAGE_URI AWS_REGION PROCESS_TIMEOUT_SECONDS STDERR_MAX_BYTES" >&2
+if [[ $# -ne 9 ]]; then
+  echo "usage: $0 CACHE_URI CACHE_SHA256 CACHE_SIZE_BYTES CONFIG_URI CONFIG_SHA256 IMAGE_URI AWS_REGION PROCESS_TIMEOUT_SECONDS STDERR_MAX_BYTES" >&2
   exit 2
 fi
 
@@ -12,12 +12,13 @@ fi
 
 CACHE_URI=$1
 CACHE_SHA256=$2
-CONFIG_URI=$3
-CONFIG_SHA256=$4
-IMAGE_URI=$5
-REGION=$6
-PROCESS_TIMEOUT_SECONDS=$7
-STDERR_MAX_BYTES=$8
+CACHE_SIZE_BYTES=$3
+CONFIG_URI=$4
+CONFIG_SHA256=$5
+IMAGE_URI=$6
+REGION=$7
+PROCESS_TIMEOUT_SECONDS=$8
+STDERR_MAX_BYTES=$9
 VEP_ROOT=/mnt/vep_data
 CONFIG_PATH=${VEP_ROOT}/vep113-GRCh38-base.json
 REGISTRY=${IMAGE_URI%%/*}
@@ -25,6 +26,7 @@ REGISTRY=${IMAGE_URI%%/*}
 case "$CACHE_URI" in s3://*) ;; *) echo "cache URI must use s3://" >&2; exit 2;; esac
 case "$CONFIG_URI" in s3://*) ;; *) echo "config URI must use s3://" >&2; exit 2;; esac
 [[ "$CACHE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$CACHE_SIZE_BYTES" =~ ^[1-9][0-9]*$ ]]
 [[ "$CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$IMAGE_URI" == *@sha256:* ]]
 [[ "$PROCESS_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]
@@ -61,34 +63,42 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+CACHE_ARCHIVE=${WORKDIR}/vep-cache.tar.gz
 CONFIG_STAGED=${WORKDIR}/vep113-GRCh38-base.json
-
-stream_verify_sha256() {
-  local expected=$1
-  python3.12 -c '
-import hashlib
-import sys
-
-expected = sys.argv[1]
-digest = hashlib.sha256()
-while chunk := sys.stdin.buffer.read(8 * 1024 * 1024):
-    digest.update(chunk)
-    sys.stdout.buffer.write(chunk)
-actual = digest.hexdigest()
-if actual != expected:
-    print(f"SHA256 mismatch: expected {expected}, found {actual}", file=sys.stderr)
-    raise SystemExit(1)
-' "$expected"
-}
 
 dnf install -y docker
 systemctl enable --now docker
 
-# Cache data is not executable Hail code. Stream it directly to the final profile-sized volume.
-# The pipeline still fails the bootstrap before cluster readiness if the profile digest does not match.
-aws s3 cp "$CACHE_URI" - --only-show-errors \
-  | stream_verify_sha256 "$CACHE_SHA256" \
-  | tar --no-same-owner --no-same-permissions -xzf - -C "$VEP_ROOT"
+# Cache archives are staged on the profile-sized volume and verified before extraction.
+aws s3 cp "$CACHE_URI" "$CACHE_ARCHIVE" --only-show-errors
+ACTUAL_CACHE_SIZE=$(stat -c '%s' "$CACHE_ARCHIVE")
+if [[ "$ACTUAL_CACHE_SIZE" != "$CACHE_SIZE_BYTES" ]]; then
+  echo "VEP cache size mismatch: expected $CACHE_SIZE_BYTES bytes, found $ACTUAL_CACHE_SIZE" >&2
+  exit 1
+fi
+printf '%s  %s\n' "$CACHE_SHA256" "$CACHE_ARCHIVE" | sha256sum -c -
+python3.12 - "$CACHE_ARCHIVE" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+path = sys.argv[1]
+with tarfile.open(path, 'r:gz') as archive:
+    for member in archive:
+        member_path = pathlib.PurePosixPath(member.name)
+        if (
+            member_path.is_absolute()
+            or '..' in member_path.parts
+            or not member_path.parts
+            or member_path.parts[0] != 'homo_sapiens'
+            or member.issym()
+            or member.islnk()
+            or member.isdev()
+        ):
+            raise SystemExit(f'unsafe VEP cache archive member: {member.name!r}')
+PY
+tar --no-same-owner --no-same-permissions -xzf "$CACHE_ARCHIVE" -C "$VEP_ROOT"
+rm -f "$CACHE_ARCHIVE"
 
 # The config controls the executable argument vector, so verify it before installing it.
 aws s3 cp "$CONFIG_URI" "$CONFIG_STAGED" --only-show-errors
@@ -120,6 +130,22 @@ mkdir -p /usr/local/libexec
 cat > /usr/local/libexec/vep-emr-root <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ \$# -ne 12 \
+  || "\${1:-}" != "--format" \
+  || "\${2:-}" != "vcf" \
+  || ( "\${3:-}" != "--json" && "\${3:-}" != "--vcf" ) \
+  || "\${4:-}" != "--cache" \
+  || "\${5:-}" != "--offline" \
+  || "\${6:-}" != "--assembly" \
+  || "\${7:-}" != "GRCh38" \
+  || "\${8:-}" != "--minimal" \
+  || "\${9:-}" != "--allele_number" \
+  || "\${10:-}" != "--no_stats" \
+  || "\${11:-}" != "--output_file" \
+  || "\${12:-}" != "STDOUT" ]]; then
+  echo "arguments do not match the installed GRCh38 VEP profile" >&2
+  exit 2
+fi
 exec docker run --rm -i \\
   -v /vep_data:/opt/vep/.vep:ro \\
   "$IMAGE_URI" \\

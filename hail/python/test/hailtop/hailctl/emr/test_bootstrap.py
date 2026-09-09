@@ -49,17 +49,28 @@ def test_vep_bootstraps_inject_process_controls_and_have_valid_shell_syntax():
     base = contents['install-vep-emr.sh']
     loftee = contents['install-loftee-emr.sh']
     assert 'mktemp -d /mnt/vep-emr-bootstrap.XXXXXX' in base
-    assert 'CACHE_ARCHIVE=' not in base
-    assert 'stream_verify_sha256' in base
-    assert 'aws s3 cp "$CACHE_URI" - --only-show-errors' in base
-    assert '| stream_verify_sha256 "$CACHE_SHA256"' in base
+    assert 'CACHE_ARCHIVE=${WORKDIR}/vep-cache.tar.gz' in base
+    assert 'aws s3 cp "$CACHE_URI" "$CACHE_ARCHIVE" --only-show-errors' in base
+    assert 'ACTUAL_CACHE_SIZE=$(stat -c' in base
+    assert 'printf \'%s  %s\\n\' "$CACHE_SHA256" "$CACHE_ARCHIVE" | sha256sum -c -' in base
+    assert "member_path.parts[0] != 'homo_sapiens'" in base
+    assert 'member.issym()' in base
+    assert 'tar --no-same-owner --no-same-permissions -xzf "$CACHE_ARCHIVE"' in base
+    assert 'stream_verify_sha256' not in base
+    assert base.index('sha256sum -c -') < base.index(
+        'tar --no-same-owner --no-same-permissions -xzf "$CACHE_ARCHIVE"'
+    )
+    assert 'arguments do not match the installed GRCh38 VEP profile' in base
     assert 'mktemp -d /mnt/loftee-emr-bootstrap.XXXXXX' in loftee
     assert 'WORKDIR=/mnt1/' not in loftee
     assert 'LOFTEE_ARCHIVE_NAME=loftee-v1.0.4_GRCh38.tar.gz' in loftee
     assert '"$LOFTEE_ARCHIVE_NAME" "$VEP_CONFIG_NAME" "$SAMTOOLS_SHIM_NAME"' in loftee
     assert 'sha256sum -c -' in loftee
     assert 'aws s3 cp "$PREFIX/$GERP_NAME" - --only-show-errors' in loftee
-    assert '| stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}"' in loftee
+    assert '| stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}" "$SIZE_LOG"' in loftee
+    assert 'ACTUAL_LOFTEE_SIZE=$(awk' in loftee
+    assert 'LoFTEE resource size mismatch' in loftee
+    assert 'arguments do not match the installed GRCh38 LoFTEE profile' in loftee
     assert 'aws s3 cp "$PREFIX/$ANCESTOR_NAME" - --only-show-errors' in loftee
     assert 'cp -a /vep_data' not in loftee
     assert 'rm -rf /vep_data' not in loftee

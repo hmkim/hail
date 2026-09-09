@@ -42,10 +42,12 @@ class VEPProfileManifest:
     image_uri: str
     cache_uri: str
     cache_sha256: str
+    cache_size_bytes: int
     base_config_uri: str
     base_config_sha256: str
     loftee_resource_prefix_uri: str
     loftee_manifest_sha256: str
+    loftee_size_bytes: int
     storage_size_gb: int
     recommended_core_instance_type: str
     executor_cores: int
@@ -97,6 +99,8 @@ class VEPProfileManifest:
             if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
                 raise ValueError(f'{name} must be a lowercase 64-character SHA256 digest')
         for name, value in (
+            ('cache_size_bytes', self.cache_size_bytes),
+            ('loftee_size_bytes', self.loftee_size_bytes),
             ('storage_size_gb', self.storage_size_gb),
             ('executor_cores', self.executor_cores),
             ('process_timeout_seconds', self.process_timeout_seconds),
@@ -157,6 +161,7 @@ class VEPProfileManifest:
         return [
             self.cache_uri,
             self.cache_sha256,
+            str(self.cache_size_bytes),
             self.base_config_uri,
             self.base_config_sha256,
             self.image_uri,
@@ -170,6 +175,7 @@ class VEPProfileManifest:
             self.loftee_resource_prefix_uri.rstrip('/'),
             self.loftee_manifest_sha256,
             self.image_uri,
+            str(self.loftee_size_bytes),
             str(self.process_timeout_seconds),
             str(self.stderr_max_bytes),
         ]

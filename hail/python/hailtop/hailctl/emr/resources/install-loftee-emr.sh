@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 RESOURCE_PREFIX SHA256SUMS_SHA256 IMAGE_URI PROCESS_TIMEOUT_SECONDS STDERR_MAX_BYTES" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: $0 RESOURCE_PREFIX SHA256SUMS_SHA256 IMAGE_URI LOFTEE_SIZE_BYTES PROCESS_TIMEOUT_SECONDS STDERR_MAX_BYTES" >&2
   exit 2
 fi
 if [[ ${EUID} -ne 0 ]]; then
@@ -12,13 +12,15 @@ fi
 PREFIX=${1%/}
 MANIFEST_SHA256=$2
 IMAGE_URI=$3
-PROCESS_TIMEOUT_SECONDS=$4
-STDERR_MAX_BYTES=$5
+LOFTEE_SIZE_BYTES=$4
+PROCESS_TIMEOUT_SECONDS=$5
+STDERR_MAX_BYTES=$6
 VEP_ROOT=/mnt/vep_data
 
 case "$PREFIX" in s3://*) ;; *) echo "resource prefix must use s3://" >&2; exit 2;; esac
 [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$IMAGE_URI" == *@sha256:* ]]
+[[ "$LOFTEE_SIZE_BYTES" =~ ^[1-9][0-9]*$ ]]
 [[ "$PROCESS_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]
 [[ "$STDERR_MAX_BYTES" =~ ^[1-9][0-9]*$ ]]
 
@@ -45,26 +47,33 @@ ANCESTOR_NAME=human_ancestor.fa.gz
 ANCESTOR_FAI_NAME=human_ancestor.fa.gz.fai
 ANCESTOR_GZI_NAME=human_ancestor.fa.gz.gzi
 LOFTEE_SQL_NAME=loftee.sql.gz
+SIZE_LOG=$WORKDIR/resource-sizes
+: > "$SIZE_LOG"
 declare -A RESOURCE_SHA256
 install -d -o root -g root -m 0755 \
   "$VEP_ROOT/loftee" "$VEP_ROOT/loftee_data" "$VEP_ROOT/bin" /usr/local/libexec
 
 stream_verify_sha256() {
   local expected=$1
+  local size_log=$2
   python3.12 -c '
 import hashlib
 import sys
 
-expected = sys.argv[1]
+expected, size_log = sys.argv[1:]
 digest = hashlib.sha256()
+size = 0
 while chunk := sys.stdin.buffer.read(8 * 1024 * 1024):
     digest.update(chunk)
+    size += len(chunk)
     sys.stdout.buffer.write(chunk)
 actual = digest.hexdigest()
 if actual != expected:
     print(f"SHA256 mismatch: expected {expected}, found {actual}", file=sys.stderr)
     raise SystemExit(1)
-' "$expected"
+with open(size_log, "a") as f:
+    print(size, file=f)
+' "$expected" "$size_log"
 }
 
 aws s3 cp "$PREFIX/SHA256SUMS" "$MANIFEST" --only-show-errors
@@ -92,6 +101,7 @@ done
 for filename in "$LOFTEE_ARCHIVE_NAME" "$VEP_CONFIG_NAME" "$SAMTOOLS_SHIM_NAME"; do
   aws s3 cp "$PREFIX/$filename" "$WORKDIR/$filename" --only-show-errors
   printf '%s  %s\n' "${RESOURCE_SHA256[$filename]}" "$WORKDIR/$filename" | sha256sum -c -
+  stat -c '%s' "$WORKDIR/$filename" >> "$SIZE_LOG"
 done
 if tar -tzf "$WORKDIR/$LOFTEE_ARCHIVE_NAME" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
   echo "LoFTEE plugin archive contains an unsafe path" >&2
@@ -104,20 +114,25 @@ install -m 0644 "$WORKDIR/$VEP_CONFIG_NAME" "$VEP_ROOT/vep.json"
 
 # Large reference datasets stream directly to their final paths while retaining provenance checks.
 aws s3 cp "$PREFIX/$GERP_NAME" - --only-show-errors \
-  | stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}" \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$GERP_NAME]}" "$SIZE_LOG" \
   > "$VEP_ROOT/loftee_data/$GERP_NAME"
 aws s3 cp "$PREFIX/$ANCESTOR_NAME" - --only-show-errors \
-  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_NAME]}" \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_NAME]}" "$SIZE_LOG" \
   > "$VEP_ROOT/loftee_data/$ANCESTOR_NAME"
 aws s3 cp "$PREFIX/$ANCESTOR_FAI_NAME" - --only-show-errors \
-  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_FAI_NAME]}" \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_FAI_NAME]}" "$SIZE_LOG" \
   > "$VEP_ROOT/loftee_data/$ANCESTOR_FAI_NAME"
 aws s3 cp "$PREFIX/$ANCESTOR_GZI_NAME" - --only-show-errors \
-  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_GZI_NAME]}" \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$ANCESTOR_GZI_NAME]}" "$SIZE_LOG" \
   > "$VEP_ROOT/loftee_data/$ANCESTOR_GZI_NAME"
 aws s3 cp "$PREFIX/$LOFTEE_SQL_NAME" - --only-show-errors \
-  | stream_verify_sha256 "${RESOURCE_SHA256[$LOFTEE_SQL_NAME]}" \
+  | stream_verify_sha256 "${RESOURCE_SHA256[$LOFTEE_SQL_NAME]}" "$SIZE_LOG" \
   | gzip -dc > "$VEP_ROOT/loftee_data/loftee.sql"
+ACTUAL_LOFTEE_SIZE=$(awk '{ total += $1 } END { print total + 0 }' "$SIZE_LOG")
+if [[ "$ACTUAL_LOFTEE_SIZE" != "$LOFTEE_SIZE_BYTES" ]]; then
+  echo "LoFTEE resource size mismatch: expected $LOFTEE_SIZE_BYTES bytes, found $ACTUAL_LOFTEE_SIZE" >&2
+  exit 1
+fi
 chmod 0644 "$VEP_ROOT/loftee_data/$GERP_NAME" \
   "$VEP_ROOT/loftee_data/$ANCESTOR_NAME" \
   "$VEP_ROOT/loftee_data/$ANCESTOR_FAI_NAME" \
@@ -141,6 +156,26 @@ chmod -R a+rX "$VEP_ROOT"
 cat > /usr/local/libexec/vep-emr-root <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ \$# -ne 16 \
+  || "\${1:-}" != "--format" \
+  || "\${2:-}" != "vcf" \
+  || ( "\${3:-}" != "--json" && "\${3:-}" != "--vcf" ) \
+  || "\${4:-}" != "--cache" \
+  || "\${5:-}" != "--offline" \
+  || "\${6:-}" != "--assembly" \
+  || "\${7:-}" != "GRCh38" \
+  || "\${8:-}" != "--minimal" \
+  || "\${9:-}" != "--allele_number" \
+  || "\${10:-}" != "--no_stats" \
+  || "\${11:-}" != "--dir_plugins" \
+  || "\${12:-}" != "/opt/vep/loftee" \
+  || "\${13:-}" != "--plugin" \
+  || "\${14:-}" != "LoF,loftee_path:/opt/vep/loftee,gerp_bigwig:/opt/vep/loftee_data/gerp_conservation_scores.homo_sapiens.GRCh38.bw,human_ancestor_fa:/opt/vep/loftee_data/human_ancestor.fa.gz,conservation_file:/opt/vep/loftee_data/loftee.sql" \
+  || "\${15:-}" != "--output_file" \
+  || "\${16:-}" != "STDOUT" ]]; then
+  echo "arguments do not match the installed GRCh38 LoFTEE profile" >&2
+  exit 2
+fi
 exec docker run --rm -i \\
   -v /vep_data/homo_sapiens:/opt/vep/.vep/homo_sapiens:ro \\
   -v /vep_data/loftee:/opt/vep/loftee:ro \\
